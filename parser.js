@@ -119,7 +119,7 @@ function normalizeKimi(payload) {
     periods.push({ name: '7d', usedPercent: ratioToPercent(value.ratelimitCode7d.ratio), remainingPercent: Math.max(0, 100 - ratioToPercent(value.ratelimitCode7d.ratio)), resetAt: value.ratelimitCode7d.resetTime || null });
   }
   if (value.subscriptionBalance && typeof value.subscriptionBalance === 'object') {
-    const used = ratioToPercent(value.subscriptionBalance.kimiCodeUsedRatio ?? value.subscriptionBalance.amountUsedRatio);
+    const used = ratioToPercent(value.subscriptionBalance.amountUsedRatio ?? value.subscriptionBalance.kimiCodeUsedRatio);
     periods.push({ name: '订阅', usedPercent: used, remainingPercent: Math.max(0, 100 - used), resetAt: value.subscriptionBalance.expireTime || null });
   }
   const used = periods.length ? Math.max(...periods.map(period => period.usedPercent)) : 0;
@@ -140,6 +140,52 @@ function normalizeQianwen(payload) {
   if (value.per1WeekPercentage !== undefined) {
     periods.push({ name: '1w', usedPercent: ratioToPercent(value.per1WeekPercentage), remainingPercent: Math.max(0, 100 - ratioToPercent(value.per1WeekPercentage)), resetAt: firstNumber(value, ['per1WeekResetTime']) });
   }
+  const used = periods.length ? Math.max(...periods.map(period => period.usedPercent)) : 0;
+  return { limit: 100, used, remaining: Math.max(0, 100 - used), unit: '%', periods, updatedAt: Date.now() };
+}
+
+function normalizeZhipu(payload) {
+  const value = unwrap(payload);
+  const limits = Array.isArray(value.limits) ? value.limits : [];
+  const parsePercentage = item => {
+      const rawPercentage = typeof item.percentage === 'string' ? item.percentage.replace('%', '') : item.percentage;
+      const percentage = Number(rawPercentage);
+      return Number.isFinite(percentage) ? Math.max(0, Math.min(100, percentage)) : null;
+  };
+  const resetAt = item => firstValue(item, ['nextResetTime', 'next_reset_time', 'resetTime', 'reset_time']);
+  const tokenLimits = limits
+    .map((item, index) => item && typeof item === 'object' && ['TOKENS_LIMIT', 'CREDIT_LIMIT'].includes(item.type)
+      ? { item, index, usedPercent: parsePercentage(item), resetAt: resetAt(item) }
+      : null)
+    .filter(entry => entry && entry.usedPercent !== null)
+    .sort((left, right) => {
+      const windowRank = item => {
+        const unit = Number(item.item.unit);
+        const number = Number(item.item.number);
+        if (unit === 3 && number === 5) return 0;
+        if (unit === 6 && (number === 1 || number === 7)) return 1;
+        return 2;
+      };
+      const rankDifference = windowRank(left) - windowRank(right);
+      if (rankDifference) return rankDifference;
+      const leftReset = Number(left.resetAt);
+      const rightReset = Number(right.resetAt);
+      if (Number.isFinite(leftReset) && Number.isFinite(rightReset) && leftReset !== rightReset) return leftReset - rightReset;
+      return left.index - right.index;
+    });
+  const periods = tokenLimits.map((entry, index) => {
+    const unit = Number(entry.item.unit);
+    const number = Number(entry.item.number);
+    const name = unit === 3 && number === 5 ? '5h' : unit === 6 && (number === 1 || number === 7) ? 'weekly' : index === 0 ? '5h' : 'weekly';
+    return { name, usedPercent: entry.usedPercent, remainingPercent: Math.max(0, 100 - entry.usedPercent), resetAt: entry.resetAt ?? null };
+  });
+  const timeLimit = limits.find(item => item && typeof item === 'object' && item.type === 'TIME_LIMIT');
+  const timeUsedPercent = timeLimit ? parsePercentage(timeLimit) : null;
+  if (timeUsedPercent !== null) {
+    periods.push({ name: 'time', usedPercent: timeUsedPercent, remainingPercent: Math.max(0, 100 - timeUsedPercent), resetAt: resetAt(timeLimit) ?? null });
+  }
+  const order = { '5h': 0, weekly: 1, time: 2 };
+  periods.sort((left, right) => order[left.name] - order[right.name]);
   const used = periods.length ? Math.max(...periods.map(period => period.usedPercent)) : 0;
   return { limit: 100, used, remaining: Math.max(0, 100 - used), unit: '%', periods, updatedAt: Date.now() };
 }
@@ -214,25 +260,21 @@ function normalizeVolcengine(payload) {
 
 function normalizeGoogleAi(payload) {
   const value = unwrap(payload);
-  const models = (value && typeof value.models === 'object') ? value.models : {};
-  let found = null;
-  for (const [key, m] of Object.entries(models)) {
-    if (!m || typeof m !== 'object') continue;
-    const name = m.displayName || key;
-    if (String(name).includes('Gemini 3.5 Flash')) { found = m; break; }
-  }
-  if (!found) return { limit: 100, used: 0, remaining: 100, unit: '%', periods: [], updatedAt: Date.now() };
-  const qi = found.quotaInfo || found.quota || {};
-  const remaining = Number.isFinite(Number(qi.remainingFraction)) ? Math.max(0, Math.min(1, Number(qi.remainingFraction))) : 1;
-  const usedPercent = Math.max(0, Math.min(100, (1 - remaining) * 100));
-  return {
-    limit: 100,
-    used: usedPercent,
-    remaining: Math.max(0, 100 - usedPercent),
-    unit: '%',
-    periods: [{ name: 'Gemini 3.5 Flash', usedPercent, remainingPercent: Math.max(0, 100 - usedPercent), resetAt: qi.resetTime || null }],
-    updatedAt: Date.now()
-  };
+  const groups = Array.isArray(value.groups) ? value.groups : [];
+  const group = groups.find(item => String(item?.displayName || '').toLowerCase() === 'gemini models')
+    || groups.find(item => String(item?.displayName || '').toLowerCase().includes('gemini'));
+  if (!group || !Array.isArray(group.buckets)) return { limit: 100, used: 0, remaining: 100, unit: '%', periods: [], updatedAt: Date.now() };
+  const labels = { '5h': '5h', weekly: 'weekly' };
+  const periods = group.buckets
+    .filter(bucket => bucket && labels[bucket.window] && Number.isFinite(Number(bucket.remainingFraction)))
+    .map(bucket => {
+      const remaining = Math.max(0, Math.min(1, Number(bucket.remainingFraction)));
+      const usedPercent = Math.max(0, Math.min(100, (1 - remaining) * 100));
+      return { name: labels[bucket.window], usedPercent, remainingPercent: Math.max(0, 100 - usedPercent), resetAt: bucket.resetTime || bucket.reset_at || null };
+    })
+    .sort((left, right) => ({ '5h': 0, weekly: 1 }[left.name] ?? 9) - ({ '5h': 0, weekly: 1 }[right.name] ?? 9));
+  const used = periods.length ? Math.max(...periods.map(period => period.usedPercent)) : 0;
+  return { limit: 100, used, remaining: Math.max(0, 100 - used), unit: '%', periods, updatedAt: Date.now() };
 }
 
-module.exports = { normalizeCodex, normalizeCodexCredits, normalizeCodexNewApi, normalizeCodexUsage, normalizeMiniMax, normalizeKimi, normalizeQianwen, normalizeLongCat, normalizeVolcengine, normalizeGoogleAi };
+module.exports = { normalizeCodex, normalizeCodexCredits, normalizeCodexNewApi, normalizeCodexUsage, normalizeMiniMax, normalizeKimi, normalizeQianwen, normalizeZhipu, normalizeLongCat, normalizeVolcengine, normalizeGoogleAi };

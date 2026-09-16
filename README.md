@@ -4,13 +4,13 @@
 [![CI](https://github.com/margrop/coding-plan-dashboard/actions/workflows/test.yml/badge.svg)](./.github/workflows/test.yml)
 
 A single-page dashboard that aggregates the coding-plan quotas of multiple AI providers
-(Codex, MiniMax, Volcengine AgentPlan / CodingPlan, Kimi Code, LongCat, Qianwen AI and
-Google AI Gemini 3.5 Flash) into one self-hosted UI. Each provider supports multiple
+(Codex, MiniMax, Volcengine AgentPlan / CodingPlan, Kimi Code, LongCat, Qianwen AI,
+ Zhipu AI CodingPlan and Google AI Gemini Models) into one self-hosted UI. Each provider supports multiple
 accounts with independent labels.
 
 一个部署在局域网中的 Coding Plan 配额看板，支持 Codex、MiniMax、火山方舟 CodingPlan /
-AgentPlan、Kimi Code、LongCat、千问 AI 和 Google AI (Gemini 3.5 Flash)。支持同一平台
-多账号，每个账号可添加备注。
+AgentPlan、Kimi Code、LongCat、千问 AI、智谱 AI CodingPlan 和 Google AI Gemini Models。支持同一平台
+多账号，每个账号可添加备注。Google AI 显示 Gemini Models 的 5 小时和周额度。
 
 ## Features / 功能
 
@@ -22,15 +22,23 @@ AgentPlan、Kimi Code、LongCat、千问 AI 和 Google AI (Gemini 3.5 Flash)。�
   JSON 文件，容器重启后自动恢复。
 - First paint shows the cached snapshot then silently refreshes to the latest data;
   successful refreshes do not pop up any dialog.
+- Five built-in visual themes (Aurora, Ocean, Forest, Sunset and Paper), each with
+  Light / Dark modes. The selected theme and mode are saved in browser local storage;
+  the appearance controls are available after unlocking the page.
 - Multi-account support: each imported curl is stored as a separate account with its
   own ID, label, edit, delete (with double confirm), and reorder controls.
+- Existing Kimi accounts can update request verification headers from a fresh
+  `GetSubscriptionStats` curl without replacing the saved URL, body, or account.
+- Existing Kimi accounts can save a complete `RefreshToken` directly; every quota
+  refresh then exchanges the stored token before calling `GetSubscriptionStats`, and
+  persists rotated access / refresh tokens plus response cookies when provided.
 - Per-account Volcengine AK/SK configuration (no curl required); uses HMAC-SHA256 V4
   signing against `GetCodingPlanUsage` / `GetAgentPlanAFPUsage`.
 - Codex supports both the official `/usage` + `/rate-limit-reset-credits` endpoints
   and a NewAPI replacement (`/api/channel/{channelId}/codex/usage[/reset-credits]`).
   The server merges them into a single Codex card and skips the official requests
   when a NewAPI variant is configured.
-- All progress bars show one-decimal usage percentage; each card shows a live
+- All progress bars show two-decimal usage percentage; each card shows a live
   countdown to the next reset in the top-right corner.
 - Self-contained single-file browser UI (`index.html`) with a custom SVG logo and no
   external favicon dependency.
@@ -51,7 +59,8 @@ AGENTS.md           Coding-agent instructions for this repository
 ### Requirements
 
 - Linux host / NAS with Docker Engine and Docker Compose v2.
-- The host must be able to reach Codex, MiniMax and Volcengine APIs.
+- The host must be able to reach the APIs for the providers you import, including
+  Zhipu AI at `www.bigmodel.cn`.
 - If you import a Codex curl with `--proxy`, the proxy must be reachable from the
   Docker host.
 - Default listen port is `8080`; change `PORT` in `docker-compose.yml` if occupied.
@@ -140,7 +149,28 @@ auto-classifies by URL:
 - `www.kimi.com/.../GetSubscriptionStats` → Kimi Code
 - `longcat.chat/api/pay/quota/metering/token-packs/summary` → LongCat
 - `cs-data.qianwenai.com/.../data/api.json` (contains `tokenplan`) → Qianwen AI TokenPlan
-- `fetchAvailableModels` (Gemini 3.5 Flash) → Google AI (Antigravity)
+- `www.bigmodel.cn/api/monitor/usage/quota/limit` → Zhipu AI CodingPlan
+- `retrieveUserQuotaSummary` (Gemini Models 5 小时 / 周额度) → Google AI (Antigravity)
+
+For Zhipu AI CodingPlan, the two `TOKENS_LIMIT` entries are distinguished by their
+window metadata and displayed separately as 5-hour Token and weekly quota; their
+`nextResetTime` values drive the countdown. `TIME_LIMIT` is displayed as MCP monthly
+quota. Paste the complete browser-copied curl; the existing restricted parser handles
+its authorization headers and cookies without spawning a shell.
+
+To repair an expired Kimi verification request, unlock the page, click **更新验证头**
+on the existing Kimi card, then paste a fresh browser-copied `GetSubscriptionStats`
+curl. The server validates the same Kimi endpoint and merges only its request headers;
+the saved account ID, URL, request body, and cached result remain unchanged until refresh.
+
+To enable automatic Kimi token renewal, unlock the page, click **设置 RefreshToken**
+or **更新 RefreshToken** on the Kimi card, then paste the complete RefreshToken JWT
+directly. The server stores only the token and required request headers, and never
+returns those fields from `/api/requests`. Device, session, and traffic headers are
+derived from JWT claims when no previous Kimi request headers exist. Each refresh
+exchanges the token first, updates the saved `Authorization` header, synchronizes
+Kimi device headers, and merges any `Set-Cookie` response into the subscription request.
+The legacy full RefreshToken cURL API remains accepted for existing configurations.
 
 Codex official and NewAPI endpoints can coexist; the server merges them into one
 card. `curl -sS`, `--proxy` and `--insecure` flags are translated into Python HTTPS
@@ -154,8 +184,8 @@ and shows "接口未返回" instead of fabricating usage.
 - The server does not shell out; imported curl is parsed and re-issued via Python
   `urllib`-style HTTPS requests.
 - The host allowlist defaults to `chatgpt.com`, `www.minimaxi.com`,
-  `console.volcengine.com`, `www.kimi.com`, `longcat.chat`,
-  `cs-data.qianwenai.com`; additional NewAPI hosts can be enabled via the
+  `console.volcengine.com`, `www.kimi.com`, `auth.kimi.com`, `longcat.chat`,
+  `cs-data.qianwenai.com`, and `www.bigmodel.cn`; additional NewAPI hosts can be enabled via the
   `NEWAPI_HOSTS` (comma-separated) environment variable and are accepted only for
   the Codex `/usage` and `/usage/reset-credits` paths.
 - Google AI uses OAuth client pairs loaded from the `GOOGLE_AI_CLIENTS`
@@ -169,8 +199,10 @@ and shows "接口未返回" instead of fabricating usage.
   `codexUsage` request, and likewise for `codexNewApiCredits` → `codexCredits`. This
   avoids repeated `401` noise when the official token is stale.
 - Raw curl (Token / Cookie / Digest) is stored in `requests.json` in plaintext, and
-  Volcengine AK/SK is stored in `credentials.json` in plaintext. Never commit real
-  credentials; the README and tests use redacted samples only.
+  Volcengine AK/SK is stored in `credentials.json` in plaintext. Kimi RefreshToken
+  input is reduced to its token and required headers in `requests.json`; it is not
+  returned by the API. Never commit real credentials; the README and tests use
+  redacted samples only.
 - Restrict `8080` to a trusted LAN and rotate credentials immediately on leak.
 
 ## Tests

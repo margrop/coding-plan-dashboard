@@ -9,7 +9,8 @@ const {
   normalizeKimi,
   normalizeLongCat,
   normalizeQianwen,
-  normalizeVolcengine
+  normalizeVolcengine,
+  normalizeZhipu
 } = require('../parser.js');
 
 test('normalizes Codex reset credit count', () => {
@@ -165,13 +166,13 @@ test('normalizes Kimi Code subscription usage periods', () => {
   const result = normalizeKimi({
     ratelimitCode5h: { ratio: 0.0002, enabled: true, resetTime: '2026-07-17T09:44:50.542928506Z' },
     ratelimitCode7d: { ratio: 0.0001, enabled: true, resetTime: '2026-07-24T04:44:49.542928506Z' },
-    subscriptionBalance: { amountUsedRatio: 0.0001, kimiCodeUsedRatio: 0.0001, expireTime: '2026-08-17T04:44:51Z' }
+    subscriptionBalance: { amountUsedRatio: 0.0933, kimiCodeUsedRatio: 0.0795, expireTime: '2026-08-17T04:44:51Z' }
   });
   assert.deepEqual(result.periods.map(period => period.name), ['5h', '7d', '订阅']);
   assert.ok(Math.abs(result.periods[0].usedPercent - 0.02) < 0.000001);
   assert.equal(result.periods[0].resetAt, '2026-07-17T09:44:50.542928506Z');
   assert.ok(Math.abs(result.periods[1].usedPercent - 0.01) < 0.000001);
-  assert.ok(Math.abs(result.periods[2].usedPercent - 0.01) < 0.000001);
+  assert.ok(Math.abs(result.periods[2].usedPercent - 9.33) < 0.000001);
   assert.equal(result.periods[2].resetAt, '2026-08-17T04:44:51Z');
 });
 
@@ -250,32 +251,74 @@ test('normalizes Qianwen AI TokenPlan usage periods', () => {
   assert.equal(result.unit, '%');
 });
 
-test('normalizes Google AI Gemini 3.5 Flash quota usage', () => {
-  const { normalizeGoogleAi } = require('../parser.js');
-  const result = normalizeGoogleAi({
-    models: {
-      'gemini-3-flash-agent': {
-        displayName: 'Gemini 3.5 Flash (High)',
-        quotaInfo: { remainingFraction: 0.55, resetTime: '2026-07-22T06:06:29Z' }
-      },
-      'other-model': {
-        displayName: 'Gemini 3.1 Pro',
-        quotaInfo: { remainingFraction: 0.1, resetTime: '2026-07-22T06:06:29Z' }
-      }
+test('normalizes Zhipu CodingPlan token and time limits', () => {
+  const result = normalizeZhipu({
+    data: {
+      limits: [
+        { type: 'TIME_LIMIT', percentage: '8.2%' },
+        { type: 'TOKENS_LIMIT', unit: 6, number: 1, percentage: 45, nextResetTime: 1787607163997 },
+        { type: 'TOKENS_LIMIT', unit: 3, number: 5, percentage: 12.5, nextResetTime: 1787176502893 },
+        { type: 'UNKNOWN_LIMIT', percentage: 99 }
+      ]
     }
   });
-  assert.equal(result.periods.length, 1);
-  assert.equal(result.periods[0].name, 'Gemini 3.5 Flash');
-  assert.ok(Math.abs(result.periods[0].usedPercent - 45) < 0.000001);
-  assert.equal(result.periods[0].resetAt, '2026-07-22T06:06:29Z');
-  assert.ok(Math.abs(result.used - 45) < 0.000001);
+  assert.deepEqual(result.periods.map(period => period.name), ['5h', 'weekly', 'time']);
+  assert.equal(result.periods[0].usedPercent, 12.5);
+  assert.equal(result.periods[0].remainingPercent, 87.5);
+  assert.equal(result.periods[0].resetAt, 1787176502893);
+  assert.equal(result.periods[1].usedPercent, 45);
+  assert.equal(result.periods[1].resetAt, 1787607163997);
+  assert.equal(result.periods[2].usedPercent, 8.2);
+  assert.equal(result.used, 45);
+  assert.equal(result.remaining, 55);
   assert.equal(result.limit, 100);
   assert.equal(result.unit, '%');
 });
 
-test('normalizes Google AI with no matching model returns empty periods', () => {
+test('orders Zhipu token windows by reset time when window metadata is absent', () => {
+  const result = normalizeZhipu({
+    data: {
+      limits: [
+        { type: 'TOKENS_LIMIT', percentage: 41, nextResetTime: 1787607163997 },
+        { type: 'TOKENS_LIMIT', percentage: 9, nextResetTime: 1787176502893 }
+      ]
+    }
+  });
+  assert.deepEqual(result.periods.map(period => period.name), ['5h', 'weekly']);
+  assert.equal(result.periods[0].usedPercent, 9);
+  assert.equal(result.periods[1].usedPercent, 41);
+});
+
+test('normalizes an empty Zhipu CodingPlan response', () => {
+  const result = normalizeZhipu({ data: { limits: [] } });
+  assert.deepEqual(result.periods, []);
+  assert.equal(result.used, 0);
+  assert.equal(result.remaining, 100);
+});
+
+test('normalizes Google AI Gemini Models five-hour and weekly quota usage', () => {
   const { normalizeGoogleAi } = require('../parser.js');
-  const result = normalizeGoogleAi({ models: { 'x': { displayName: 'Other', quotaInfo: { remainingFraction: 1 } } } });
+  const result = normalizeGoogleAi({
+    groups: [{
+      displayName: 'Gemini Models',
+      buckets: [
+        { bucketId: 'gemini-weekly', window: 'weekly', remainingFraction: 0.99498266 },
+        { bucketId: 'gemini-5h', window: '5h', remainingFraction: 1 }
+      ]
+    }]
+  });
+  assert.equal(result.periods.length, 2);
+  assert.deepEqual(result.periods.map(period => period.name), ['5h', 'weekly']);
+  assert.equal(result.periods[0].usedPercent, 0);
+  assert.ok(Math.abs(result.periods[1].usedPercent - 0.501734) < 0.000001);
+  assert.ok(Math.abs(result.used - 0.501734) < 0.000001);
+  assert.equal(result.limit, 100);
+  assert.equal(result.unit, '%');
+});
+
+test('normalizes Google AI without Gemini Models group as empty periods', () => {
+  const { normalizeGoogleAi } = require('../parser.js');
+  const result = normalizeGoogleAi({ groups: [{ displayName: 'Claude and GPT models', buckets: [] }] });
   assert.equal(result.periods.length, 0);
   assert.equal(result.used, 0);
 });

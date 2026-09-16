@@ -5,6 +5,7 @@ import os
 import re
 import shlex
 import uuid
+import base64
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -114,9 +115,14 @@ def execute_volcengine_openapi(credentials, action):
 GOOGLE_OAUTH_URL = "https://oauth2.googleapis.com/token"
 GOOGLE_UA = "antigravity-tools/1.1.5"
 GOOGLE_BASES = [
-    "https://cloudcode-pa.googleapis.com",
     "https://daily-cloudcode-pa.googleapis.com",
+    "https://cloudcode-pa.googleapis.com",
     "https://daily-cloudcode-pa.sandbox.googleapis.com",
+]
+GOOGLE_QUOTA_ENDPOINTS = [
+    "retrieveUserQuotaSummary",
+    "retrieveUserQuota",
+    "loadCodeAssist",
 ]
 def _load_google_clients():
     """Resolve Google AI OAuth client pairs.
@@ -195,23 +201,28 @@ def execute_google_ai(credentials):
         return 1, "", f"oauth refresh failed: {last_error}"
     body = b"{}"
     last_error = None
-    for base in GOOGLE_BASES:
-        request = Request(
-            f"{base}/v1internal:fetchAvailableModels",
-            data=body,
-            method="POST",
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "User-Agent": GOOGLE_UA},
-        )
-        try:
-            opener = _google_opener(proxy)
-            context = opener.open(request, timeout=35) if opener else urlopen(request, timeout=35)
-            with context as response:
-                return response.status, response.read().decode("utf-8", errors="replace"), ""
-        except HTTPError as error:
-            last_error = f"HTTP {error.code} {error.reason} @ {base}"
-        except URLError as error:
-            last_error = f"{error.reason} @ {base}"
-    return 1, "", f"fetchAvailableModels failed: {last_error}"
+
+    for endpoint in GOOGLE_QUOTA_ENDPOINTS:
+        for base in GOOGLE_BASES:
+            request = Request(
+                f"{base}/v1internal:{endpoint}",
+                data=body,
+                method="POST",
+                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json", "User-Agent": GOOGLE_UA},
+            )
+            try:
+                opener = _google_opener(proxy)
+                context = opener.open(request, timeout=35) if opener else urlopen(request, timeout=35)
+                with context as response:
+                    response_body = response.read().decode("utf-8", errors="replace")
+                    if "remainingFraction" in response_body or "remaining_fraction" in response_body:
+                        return response.status, response_body, ""
+                    last_error = f"HTTP {response.status} no quota data @ {base}/{endpoint}"
+            except HTTPError as error:
+                last_error = f"HTTP {error.code} {error.reason} @ {base}/{endpoint}"
+            except URLError as error:
+                last_error = f"{error.reason} @ {base}/{endpoint}"
+    return 1, "", f"quota endpoints failed: {last_error}"
 
 
 def mask_secret(secret):
@@ -254,13 +265,77 @@ def should_skip_source(source, accounts):
     return skip_usage or skip_credits
 
 
+def find_matching_newapi_account(curl, requests):
+    """Find an existing NewAPI account for the same Codex endpoint."""
+    url, _ = parse_curl(curl)
+    parsed = urlparse(url)
+    source = infer_source(curl)
+    for account_id, definition in requests.items():
+        if definition.get("source") != source:
+            continue
+        try:
+            existing_url, _ = parse_curl(definition.get("curl", ""))
+        except ValueError:
+            continue
+        existing = urlparse(existing_url)
+        if existing.hostname == parsed.hostname and existing.port == parsed.port and existing.path == parsed.path:
+            return account_id
+    return None
+
+
+def provider_response_ok(source, code, body):
+    """Treat HTTP 200 business-error responses as failed provider calls."""
+    if not is_success_status(code):
+        return False
+    if source not in {NEWAPI_CODEX_USAGE_PATH, NEWAPI_CODEX_CREDITS_PATH, "qianwen", "zhipuCoding", "minimax"}:
+        return True
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return False
+    if source == "qianwen":
+        data = payload.get("data")
+        return isinstance(data, dict) and data.get("success") is not False and not data.get("errorCode") and not data.get("errorMsg")
+    if source == "zhipuCoding":
+        data = payload.get("data")
+        return isinstance(data, dict) and isinstance(data.get("limits"), list)
+    if source == "minimax":
+        base_resp = payload.get("base_resp")
+        if isinstance(base_resp, dict):
+            return base_resp.get("status_code") == 0
+        return True
+    return payload.get("success") is not False and "Unauthorized" not in str(payload.get("message", ""))
+
+
+def provider_response_error(source, body):
+    if source not in {"qianwen", "zhipuCoding", "minimax"}:
+        return ""
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return ""
+    if source == "zhipuCoding":
+        return str(payload.get("message") or payload.get("msg") or payload.get("error") or "").strip()
+    if source == "minimax":
+        base_resp = payload.get("base_resp")
+        if isinstance(base_resp, dict):
+            return str(base_resp.get("status_msg") or "").strip()
+        return ""
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("errorMsg") or data.get("errorCode") or "").strip()
+
+
 ALLOWED_HOSTS = {
     "chatgpt.com",
     "www.minimaxi.com",
     "console.volcengine.com",
     "www.kimi.com",
+    "auth.kimi.com",
     "longcat.chat",
     "cs-data.qianwenai.com",
+    "www.bigmodel.cn",
 }
 # NewAPI gateway hosts allowed to serve /api/channel/{id}/codex/{usage,usage/reset-credits}.
 # Configurable via NEWAPI_HOSTS env var (comma-separated hostnames). Defaults to the
@@ -310,6 +385,16 @@ def parse_curl(command):
             args.append(token)
             index += 1
             continue
+        if token == "--url":
+            if index + 1 >= len(tokens):
+                raise ValueError("missing value for --url")
+            urls.append(tokens[index + 1])
+            index += 2
+            continue
+        if token.startswith("--url="):
+            urls.append(token[6:])
+            index += 1
+            continue
         if token in ALLOWED_OPTIONS_WITH_VALUE:
             if index + 1 >= len(tokens):
                 raise ValueError(f"missing value for {token}")
@@ -353,6 +438,8 @@ def infer_source(command):
         return "longcat"
     if parsed.hostname == "cs-data.qianwenai.com" and path.endswith("/data/api.json") and "tokenplan" in parsed.query:
         return "qianwen"
+    if parsed.hostname == "www.bigmodel.cn" and path.rstrip("/") == "/api/monitor/usage/quota/limit":
+        return "zhipuCoding"
     if parsed.hostname == "www.minimaxi.com":
         return "minimax"
     if parsed.hostname == "console.volcengine.com" and path.endswith("GetCodingPlanUsage"):
@@ -360,6 +447,399 @@ def infer_source(command):
     if parsed.hostname == "console.volcengine.com" and path.endswith(("GetAgentPlanUsageDetails", "GetAgentPlanAFPUsage")):
         return "volcAgent"
     raise ValueError("unable to infer source from URL")
+
+
+KIMI_VERIFICATION_HEADERS = {"authorization", "cookie", "x-traffic-id"}
+KIMI_IGNORED_HEADERS = {"connection", "content-length", "host"}
+KIMI_REFRESH_URL = "https://auth.kimi.com/api/account.gateway.v1.AuthService/RefreshToken"
+KIMI_REFRESH_IGNORED_HEADERS = KIMI_IGNORED_HEADERS | {"content-type"}
+KIMI_DYNAMIC_HEADERS = {
+    "origin",
+    "referer",
+    "r-timezone",
+    "user-agent",
+    "x-language",
+    "x-msh-device-id",
+    "x-msh-platform",
+    "x-msh-session-id",
+    "x-msh-version",
+    "x-traffic-id",
+}
+KIMI_DEFAULT_REFRESH_HEADERS = {
+    "accept": "*/*",
+    "accept-language": "zh-CN,zh;q=0.9",
+    "connect-protocol-version": "1",
+    "origin": "https://www.kimi.com",
+    "r-timezone": "Asia/Hong_Kong",
+    "referer": "https://www.kimi.com/",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+    "x-msh-platform": "web",
+    "x-msh-version": "2.0.0",
+}
+
+
+def _normalize_curl_header_name(raw):
+    return raw.split(":", 1)[0].strip().rstrip(";").strip().lower()
+
+
+def _curl_header_entries(args):
+    entries = []
+    index = 1
+    while index < len(args) - 1:
+        token = args[index]
+        if token in {"-H", "--header"}:
+            raw = args[index + 1]
+            name = _normalize_curl_header_name(raw)
+            if name:
+                entries.append((name, raw))
+            index += 2
+            continue
+        if token in {"-b", "--cookie"}:
+            entries.append(("cookie", f"Cookie: {args[index + 1]}"))
+            index += 2
+            continue
+        if token in {"-A", "--user-agent"}:
+            entries.append(("user-agent", f"User-Agent: {args[index + 1]}"))
+            index += 2
+            continue
+        if token in ALLOWED_OPTIONS_WITH_VALUE:
+            index += 2
+            continue
+        index += 1
+    return entries
+
+
+def _curl_header_value(raw):
+    _, separator, value = raw.partition(":")
+    return value.lstrip() if separator else ""
+
+
+def _decode_jwt_payload(token):
+    parts = str(token).split(".")
+    if len(parts) != 3:
+        return {}
+    try:
+        encoded = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def kimi_refresh_headers_for_token(token, existing_headers=None):
+    """Complete direct-token configuration without requiring a copied cURL."""
+    headers = dict(KIMI_DEFAULT_REFRESH_HEADERS)
+    if isinstance(existing_headers, dict):
+        headers.update({str(name).lower(): str(value) for name, value in existing_headers.items()})
+    payload = _decode_jwt_payload(token)
+    claims = {
+        "x-msh-device-id": payload.get("device_id"),
+        "x-msh-session-id": payload.get("ssid"),
+        "x-traffic-id": payload.get("sub"),
+    }
+    headers.update({name: str(value) for name, value in claims.items() if value not in (None, "")})
+    return headers
+
+
+def parse_kimi_refresh_curl(refresh_curl):
+    """Extract the Kimi refresh token and safe request headers from a cURL."""
+    refresh_url, refresh_args = parse_curl(refresh_curl)
+    endpoint = urlparse(refresh_url)
+    expected = urlparse(KIMI_REFRESH_URL)
+    if (endpoint.scheme, endpoint.hostname, endpoint.port, endpoint.path) != (
+        expected.scheme,
+        expected.hostname,
+        expected.port,
+        expected.path,
+    ):
+        raise ValueError("Kimi RefreshToken cURL must target the RefreshToken endpoint")
+
+    request, proxy = build_http_request(refresh_args)
+    if proxy:
+        raise ValueError("Kimi RefreshToken cURL must not contain a proxy")
+    if request.method != "POST" or request.data is None:
+        raise ValueError("Kimi RefreshToken cURL must contain a POST JSON body")
+    try:
+        payload = json.loads(request.data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Kimi RefreshToken body must be valid JSON") from error
+    if not isinstance(payload, dict) or not str(payload.get("refresh_token", "")).strip():
+        raise ValueError("Kimi RefreshToken body must contain refresh_token")
+
+    headers = {}
+    for name, raw in _curl_header_entries(refresh_args):
+        if name not in KIMI_REFRESH_IGNORED_HEADERS:
+            headers[name] = _curl_header_value(raw)
+    return str(payload["refresh_token"]).strip(), headers
+
+
+def _replace_curl_headers(existing_curl, updates):
+    """Replace selected headers in an existing parsed cURL without changing its body."""
+    existing_url, existing_args = parse_curl(existing_curl)
+    merged = [existing_args[0]]
+    replaced = set()
+    index = 1
+    while index < len(existing_args) - 1:
+        token = existing_args[index]
+        if token in {"-H", "--header"}:
+            raw = existing_args[index + 1]
+            name = _normalize_curl_header_name(raw)
+            if name in updates:
+                if name not in replaced:
+                    merged.extend(["-H", f"{name}: {updates[name]}"])
+                    replaced.add(name)
+            else:
+                merged.extend([token, raw])
+            index += 2
+            continue
+        if token in {"-b", "--cookie"}:
+            if "cookie" in updates:
+                if "cookie" not in replaced:
+                    merged.extend(["-H", f"Cookie: {updates['cookie']}"])
+                    replaced.add("cookie")
+            else:
+                merged.extend([token, existing_args[index + 1]])
+            index += 2
+            continue
+        if token in {"-A", "--user-agent"}:
+            if "user-agent" in updates:
+                if "user-agent" not in replaced:
+                    merged.extend(["-H", f"User-Agent: {updates['user-agent']}"])
+                    replaced.add("user-agent")
+            else:
+                merged.extend([token, existing_args[index + 1]])
+            index += 2
+            continue
+        if token in ALLOWED_OPTIONS_WITH_VALUE:
+            merged.extend([token, existing_args[index + 1]])
+            index += 2
+            continue
+        merged.append(token)
+        index += 1
+    for name, value in updates.items():
+        if name not in replaced:
+            merged.extend(["-H", f"{name}: {value}"])
+    merged.append(existing_url)
+    return " ".join(shlex.quote(arg) for arg in merged)
+
+
+def _extract_json_value(payload, keys):
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if str(key).lower() in keys and isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            found = _extract_json_value(value, keys)
+            if found:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = _extract_json_value(value, keys)
+            if found:
+                return found
+    return ""
+
+
+def _response_error_message(body):
+    try:
+        payload = json.loads(body)
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    details = payload.get("details")
+    if isinstance(details, list):
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            debug = detail.get("debug")
+            if isinstance(debug, dict):
+                reason = debug.get("reason")
+                if isinstance(reason, str) and reason.strip():
+                    return reason.strip()[:160]
+            value = detail.get("value")
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:160]
+    for key in ("message", "error_description", "error", "msg", "code"):
+        value = payload.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()[:160]
+    return ""
+
+
+def _set_cookie_pairs(headers):
+    pairs = {}
+    for value in headers or []:
+        pair = str(value).split(";", 1)[0].strip()
+        name, separator, cookie_value = pair.partition("=")
+        if separator and name.strip():
+            pairs[name.strip()] = cookie_value.strip()
+    return pairs
+
+
+def _merge_cookie_header(existing_cookie, set_cookie_headers):
+    cookies = {}
+    for part in str(existing_cookie or "").split(";"):
+        name, separator, value = part.strip().partition("=")
+        if separator and name:
+            cookies[name] = value
+    for name, value in _set_cookie_pairs(set_cookie_headers).items():
+        if value:
+            cookies[name] = value
+        else:
+            cookies.pop(name, None)
+    return "; ".join(f"{name}={value}" for name, value in cookies.items())
+
+
+def _kimi_subscription_headers(curl):
+    _, args = parse_curl(curl)
+    return {name: _curl_header_value(raw) for name, raw in _curl_header_entries(args)}
+
+
+def refresh_kimi_access_token(definition):
+    """Refresh Kimi credentials and return an updated subscription cURL definition."""
+    refresh_token = str(definition.get("kimiRefreshToken", "")).strip()
+    if not refresh_token:
+        return 0, {}, "missing Kimi RefreshToken configuration"
+    configured_headers = definition.get("kimiRefreshHeaders", {})
+    headers = {
+        str(name).lower(): str(value)
+        for name, value in configured_headers.items()
+        if isinstance(name, str) and name.lower() not in KIMI_REFRESH_IGNORED_HEADERS
+    } if isinstance(configured_headers, dict) else {}
+    headers["content-type"] = "application/json"
+    body = json.dumps({"refresh_token": refresh_token}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    request = Request(KIMI_REFRESH_URL, data=body, headers=headers, method="POST")
+    try:
+        with urlopen(request, timeout=35) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            response_headers = response.headers.get_all("Set-Cookie", [])
+            status = response.status
+    except HTTPError as error:
+        response_body = error.read().decode("utf-8", errors="replace")
+        response_headers = error.headers.get_all("Set-Cookie", []) if error.headers else []
+        return error.code, {}, f"Kimi RefreshToken HTTP {error.code}: {_response_error_message(response_body) or error.reason}"
+    except URLError as error:
+        return 1, {}, f"Kimi RefreshToken request failed: {error.reason}"
+
+    if status != 200:
+        return status, {}, f"Kimi RefreshToken HTTP {status}: {_response_error_message(response_body) or 'request failed'}"
+    try:
+        payload = json.loads(response_body)
+    except json.JSONDecodeError:
+        return status, {}, "Kimi RefreshToken returned invalid JSON"
+    access_token = _extract_json_value(payload, {"access_token", "accesstoken", "token"})
+    if not access_token:
+        return status, {}, "Kimi RefreshToken response did not contain an access token"
+    new_refresh_token = _extract_json_value(payload, {"refresh_token", "refreshtoken"})
+    updated = dict(definition)
+    updated["kimiRefreshToken"] = new_refresh_token or refresh_token
+    subscription_headers = _kimi_subscription_headers(definition.get("curl", ""))
+    updates = {"authorization": f"Bearer {access_token}"}
+    updates.update({name: value for name, value in headers.items() if name in KIMI_DYNAMIC_HEADERS})
+    cookie = _merge_cookie_header(subscription_headers.get("cookie", ""), response_headers)
+    if cookie:
+        updates["cookie"] = cookie
+    updated["curl"] = _replace_curl_headers(definition.get("curl", ""), updates)
+    return status, updated, ""
+
+
+def merge_verification_curl(existing_curl, verification_curl, ignored_headers, required_prefixes, source_name):
+    """Merge verification headers from a new cURL into an existing one.
+
+    Args:
+        existing_curl: The original cURL command to update.
+        verification_curl: The new cURL command containing fresh headers.
+        ignored_headers: Set of header names to skip (e.g. connection, content-length).
+        required_prefixes: Tuple of header name prefixes that must be present (e.g. ("authorization", "cookie", "x-msh-")).
+        source_name: Human-readable source name for error messages.
+    """
+    existing_url, existing_args = parse_curl(existing_curl)
+    verification_url, verification_args = parse_curl(verification_curl)
+    if infer_source(existing_curl) != infer_source(verification_curl):
+        raise ValueError(f"both requests must target the same {source_name} endpoint")
+    existing_endpoint = urlparse(existing_url)
+    verification_endpoint = urlparse(verification_url)
+    if (existing_endpoint.scheme, existing_endpoint.hostname, existing_endpoint.port, existing_endpoint.path) != (
+        verification_endpoint.scheme,
+        verification_endpoint.hostname,
+        verification_endpoint.port,
+        verification_endpoint.path,
+    ):
+        raise ValueError(f"new {source_name} request must target the existing endpoint")
+    updates = {
+        name: raw
+        for name, raw in _curl_header_entries(verification_args)
+        if name not in ignored_headers
+    }
+    if not updates or not any(name.startswith(required_prefixes) for name in updates):
+        raise ValueError(f"new {source_name} request is missing verification headers")
+    merged = [existing_args[0]]
+    replaced = set()
+    index = 1
+    while index < len(existing_args) - 1:
+        token = existing_args[index]
+        if token in {"-H", "--header"}:
+            raw = existing_args[index + 1]
+            name = _normalize_curl_header_name(raw)
+            if name in updates:
+                if name not in replaced:
+                    merged.extend(["-H", updates[name]])
+                    replaced.add(name)
+            else:
+                merged.extend([token, raw])
+            index += 2
+            continue
+        if token in {"-b", "--cookie"}:
+            if "cookie" in updates:
+                if "cookie" not in replaced:
+                    merged.extend(["-H", updates["cookie"]])
+                    replaced.add("cookie")
+            else:
+                merged.extend([token, existing_args[index + 1]])
+            index += 2
+            continue
+        if token in {"-A", "--user-agent"}:
+            if "user-agent" in updates:
+                if "user-agent" not in replaced:
+                    merged.extend(["-H", updates["user-agent"]])
+                    replaced.add("user-agent")
+            else:
+                merged.extend([token, existing_args[index + 1]])
+            index += 2
+            continue
+        if token in ALLOWED_OPTIONS_WITH_VALUE:
+            merged.extend([token, existing_args[index + 1]])
+            index += 2
+            continue
+        merged.append(token)
+        index += 1
+    for name, raw in _curl_header_entries(verification_args):
+        if name in updates and name not in replaced:
+            merged.extend(["-H", raw])
+            replaced.add(name)
+    merged.append(existing_args[-1])
+    return " ".join(shlex.quote(arg) for arg in merged)
+
+
+def merge_kimi_verification_curl(existing_curl, verification_curl):
+    return merge_verification_curl(
+        existing_curl,
+        verification_curl,
+        KIMI_IGNORED_HEADERS,
+        ("authorization", "cookie", "x-msh-"),
+        "Kimi",
+    )
+
+
+def merge_minimax_verification_curl(existing_curl, verification_curl):
+    return merge_verification_curl(
+        existing_curl,
+        verification_curl,
+        {"connection", "content-length", "host"},
+        ("cookie", "authorization", "x-"),
+        "MiniMax",
+    )
 
 
 def load_requests(path):
@@ -470,6 +950,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             masked = {}
             for aid, acc in accounts.items():
                 item = dict(acc)
+                item.pop("proxy", None)
+                kimi_refresh_configured = bool(item.get("kimiRefreshToken"))
+                item.pop("kimiRefreshToken", None)
+                item.pop("kimiRefreshHeaders", None)
+                if acc.get("source") == "kimi":
+                    item["hasKimiRefreshToken"] = kimi_refresh_configured
                 if "sk" in item:
                     item["sk"] = mask_secret(item["sk"])
                     item["hasCreds"] = True
@@ -532,10 +1018,78 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 explicit_source = str(payload.get("source", "")).strip()
                 requests = load_requests(self.requests_path)
                 existing = requests.get(account_id, {}) if account_id else {}
+                if "kimiRefreshToken" in payload:
+                    if not account_id:
+                        raise ValueError("id is required for Kimi RefreshToken updates")
+                    if existing.get("source") != "kimi":
+                        raise ValueError("account is not a Kimi account")
+                    refresh_token_value = str(payload.get("kimiRefreshToken", "")).strip()
+                    if not refresh_token_value:
+                        raise ValueError("kimiRefreshToken is required")
+                    updated = dict(existing)
+                    updated["kimiRefreshToken"] = refresh_token_value
+                    updated["kimiRefreshHeaders"] = kimi_refresh_headers_for_token(
+                        refresh_token_value,
+                        existing.get("kimiRefreshHeaders", {}),
+                    )
+                    updated["updatedAt"] = now_iso()
+                    requests[account_id] = updated
+                    save_requests(self.requests_path, requests)
+                    self.send_json({"ok": True, "id": account_id, "source": "kimi", "updatedAt": updated["updatedAt"]})
+                    return
+                if "kimiRefreshCurl" in payload:
+                    if not account_id:
+                        raise ValueError("id is required for Kimi RefreshToken updates")
+                    if existing.get("source") != "kimi":
+                        raise ValueError("account is not a Kimi account")
+                    refresh_curl = str(payload.get("kimiRefreshCurl", "")).strip()
+                    if not refresh_curl:
+                        raise ValueError("kimiRefreshCurl is required")
+                    refresh_token_value, refresh_headers = parse_kimi_refresh_curl(refresh_curl)
+                    updated = dict(existing)
+                    updated["kimiRefreshToken"] = refresh_token_value
+                    updated["kimiRefreshHeaders"] = refresh_headers
+                    updated["updatedAt"] = now_iso()
+                    requests[account_id] = updated
+                    save_requests(self.requests_path, requests)
+                    self.send_json({"ok": True, "id": account_id, "source": "kimi", "updatedAt": updated["updatedAt"]})
+                    return
+                if "kimiVerificationCurl" in payload:
+                    if not account_id:
+                        raise ValueError("id is required for Kimi verification updates")
+                    if existing.get("source") != "kimi":
+                        raise ValueError("account is not a Kimi account")
+                    verification_curl = str(payload.get("kimiVerificationCurl", "")).strip()
+                    if not verification_curl:
+                        raise ValueError("kimiVerificationCurl is required")
+                    updated = dict(existing)
+                    updated["curl"] = merge_kimi_verification_curl(existing.get("curl", ""), verification_curl)
+                    updated["updatedAt"] = now_iso()
+                    requests[account_id] = updated
+                    save_requests(self.requests_path, requests)
+                    self.send_json({"ok": True, "id": account_id, "source": "kimi", "updatedAt": updated["updatedAt"]})
+                    return
+                if "minimaxVerificationCurl" in payload:
+                    if not account_id:
+                        raise ValueError("id is required for MiniMax verification updates")
+                    if existing.get("source") != "minimax":
+                        raise ValueError("account is not a MiniMax account")
+                    verification_curl = str(payload.get("minimaxVerificationCurl", "")).strip()
+                    if not verification_curl:
+                        raise ValueError("minimaxVerificationCurl is required")
+                    updated = dict(existing)
+                    updated["curl"] = merge_minimax_verification_curl(existing.get("curl", ""), verification_curl)
+                    updated["updatedAt"] = now_iso()
+                    requests[account_id] = updated
+                    save_requests(self.requests_path, requests)
+                    self.send_json({"ok": True, "id": account_id, "source": "minimax", "updatedAt": updated["updatedAt"]})
+                    return
                 if not curl and existing:
                     curl = existing.get("curl", "")
                 if curl:
                     source = infer_source(curl)
+                    if not account_id and source in {NEWAPI_CODEX_USAGE_PATH, NEWAPI_CODEX_CREDITS_PATH}:
+                        account_id = find_matching_newapi_account(curl, requests) or ""
                 elif explicit_source in CREDENTIAL_SOURCES and not existing:
                     source = explicit_source
                     if source in VOLC_ACTIONS and not (ak and sk_input):
@@ -556,6 +1110,9 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 if source == "googleAi":
                     definition["refreshToken"] = refresh_token or existing.get("refreshToken", "")
                     definition["proxy"] = proxy_input or existing.get("proxy", "")
+                if source == "kimi" and existing.get("source") == "kimi":
+                    definition["kimiRefreshToken"] = existing.get("kimiRefreshToken", "")
+                    definition["kimiRefreshHeaders"] = existing.get("kimiRefreshHeaders", {})
                 requests[account_id] = definition
                 save_requests(self.requests_path, requests)
                 self.send_json({"ok": True, "id": account_id, "source": source})
@@ -584,6 +1141,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             cached_results = load_results(self.results_path)
             credentials = load_credentials(self.credentials_path)
             accounts = load_requests(self.requests_path)
+            requests_changed = False
             for account_id, definition in accounts.items():
                 source = definition.get("source", "")
                 if should_skip_source(source, accounts):
@@ -603,15 +1161,32 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                             code, stdout, stderr = execute_google_ai({"refreshToken": refresh_token, "proxy": proxy})
                         else:
                             code, stdout, stderr = execute_curl(definition.get("curl", ""))
+                    elif source == "kimi" and definition.get("kimiRefreshToken"):
+                        code, refreshed_definition, stderr = refresh_kimi_access_token(definition)
+                        if refreshed_definition:
+                            accounts[account_id] = refreshed_definition
+                            requests_changed = True
+                            definition = refreshed_definition
+                            code, stdout, curl_error = execute_curl(definition.get("curl", ""))
+                            stderr = curl_error
+                        else:
+                            stdout = ""
+                            if code == 200:
+                                code = 502
                     else:
                         code, stdout, stderr = execute_curl(definition.get("curl", ""))
-                    updated_at = now_iso() if is_success_status(code) else None
-                    result = {"ok": is_success_status(code), "status": code, "body": stdout, "error": stderr, "updatedAt": updated_at}
+                    provider_ok = provider_response_ok(source, code, stdout)
+                    if not provider_ok and is_success_status(code):
+                        stderr = stderr or provider_response_error(source, stdout) or "provider returned an unsuccessful business response"
+                    updated_at = now_iso() if provider_ok else None
+                    result = {"ok": provider_ok, "status": code, "body": stdout, "error": stderr, "updatedAt": updated_at}
                     results[account_id] = result
-                    if is_success_status(code):
+                    if provider_ok:
                         cached_results[account_id] = result
                 except (ValueError, OSError, TimeoutError) as error:
                     results[account_id] = {"ok": False, "status": None, "body": "", "error": str(error)}
+            if requests_changed:
+                save_requests(self.requests_path, accounts)
             save_results(self.results_path, cached_results)
             self.send_json(results)
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
