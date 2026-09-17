@@ -5,7 +5,7 @@
 
 A single-page dashboard that aggregates the coding-plan quotas of multiple AI providers
 (Codex, MiniMax, Volcengine AgentPlan / CodingPlan, Kimi Code, LongCat, Qianwen AI,
- Zhipu AI CodingPlan and Google AI Gemini Models) into one self-hosted UI. Each provider supports multiple
+Zhipu AI CodingPlan and Google AI Gemini Models) into one self-hosted UI. Each provider supports multiple
 accounts with independent labels.
 
 一个部署在局域网中的 Coding Plan 配额看板，支持 Codex、MiniMax、火山方舟 CodingPlan /
@@ -32,6 +32,10 @@ AgentPlan、Kimi Code、LongCat、千问 AI、智谱 AI CodingPlan 和 Google AI
 - Existing Kimi accounts can save a complete `RefreshToken` directly; every quota
   refresh then exchanges the stored token before calling `GetSubscriptionStats`, and
   persists rotated access / refresh tokens plus response cookies when provided.
+- Existing MiniMax accounts can update verification headers from a fresh
+  `token_plan/remains_percent` curl while preserving the account and request body.
+- Refresh failures, including supported provider business errors returned with HTTP
+  200, keep the last successful cached result visible with an error notice.
 - Per-account Volcengine AK/SK configuration (no curl required); uses HMAC-SHA256 V4
   signing against `GetCodingPlanUsage` / `GetAgentPlanAFPUsage`.
 - Codex supports both the official `/usage` + `/rate-limit-reset-credits` endpoints
@@ -39,7 +43,9 @@ AgentPlan、Kimi Code、LongCat、千问 AI、智谱 AI CodingPlan 和 Google AI
   The server merges them into a single Codex card and skips the official requests
   when a NewAPI variant is configured.
 - All progress bars show two-decimal usage percentage; each card shows a live
-  countdown to the next reset in the top-right corner.
+  countdown to the next reset. Reset dates are shown when at least one day remains;
+  shorter waits show only the countdown. A normalized zero quota limit is displayed
+  as **已过期**; authentication failures are reported separately.
 - Self-contained single-file browser UI (`index.html`) with a custom SVG logo and no
   external favicon dependency.
 
@@ -108,10 +114,11 @@ sudo docker compose up -d --force-recreate
 ## Persistent Data & Backups
 
 ```text
-/docker/coding_plan_quota_dashboard/data/requests.json    # imported curl, contains secrets
-/docker/coding_plan_quota_dashboard/data/credentials.json # per-account Volcengine AK/SK
+/docker/coding_plan_quota_dashboard/data/requests.json    # per-account curl, AK/SK and refresh tokens
+/docker/coding_plan_quota_dashboard/data/credentials.json # legacy provider credentials
 /docker/coding_plan_quota_dashboard/data/snapshot.json    # latest quota snapshot
 /docker/coding_plan_quota_dashboard/data/results.json     # per-account cached API responses
+/docker/coding_plan_quota_dashboard/data/order.json       # account display order
 ```
 
 Backup:
@@ -130,8 +137,9 @@ sudo tar -xzf coding_plan_quota_dashboard-data-YYYYMMDD-HHMMSS.tar.gz
 sudo docker compose up -d
 ```
 
-Treat `requests.json` and `credentials.json` as secrets: do **not** commit them, and
-never publish the backup file to a public download location.
+Treat the entire data directory and its backups as sensitive: requests and
+credentials contain secrets, while snapshots and API responses can contain account
+information. Do **not** commit or publish them.
 
 ## Importing Requests
 
@@ -150,7 +158,13 @@ auto-classifies by URL:
 - `longcat.chat/api/pay/quota/metering/token-packs/summary` → LongCat
 - `cs-data.qianwenai.com/.../data/api.json` (contains `tokenplan`) → Qianwen AI TokenPlan
 - `www.bigmodel.cn/api/monitor/usage/quota/limit` → Zhipu AI CodingPlan
-- `retrieveUserQuotaSummary` (Gemini Models 5 小时 / 周额度) → Google AI (Antigravity)
+
+Google AI uses the dedicated account form, not curl auto-detection. Unlock the page,
+add an OAuth Refresh Token and an optional proxy, and configure `GOOGLE_AI_CLIENTS`
+on the server (see Security Notes). The server tries `retrieveUserQuotaSummary`,
+`retrieveUserQuota` and `loadCodeAssist` across its configured Google endpoints.
+The dashboard displays Gemini Models 5-hour and weekly buckets when the response
+contains the supported quota structure; it cannot display absent bucket data.
 
 For Zhipu AI CodingPlan, the two `TOKENS_LIMIT` entries are distinguished by their
 window metadata and displayed separately as 5-hour Token and weekly quota; their
@@ -167,10 +181,19 @@ To enable automatic Kimi token renewal, unlock the page, click **设置 RefreshT
 or **更新 RefreshToken** on the Kimi card, then paste the complete RefreshToken JWT
 directly. The server stores only the token and required request headers, and never
 returns those fields from `/api/requests`. Device, session, and traffic headers are
-derived from JWT claims when no previous Kimi request headers exist. Each refresh
+derived from available JWT claims and override corresponding saved header values. Each refresh
 exchanges the token first, updates the saved `Authorization` header, synchronizes
 Kimi device headers, and merges any `Set-Cookie` response into the subscription request.
 The legacy full RefreshToken cURL API remains accepted for existing configurations.
+
+To update MiniMax authentication, unlock the page, click **更新验证头** on its card,
+and paste a fresh browser-copied `token_plan/remains_percent` curl. Cookie and other
+verification headers are merged into the saved request; the URL, body and account
+ID are preserved. HTTP 200 with a nonzero `base_resp.status_code` is treated as a
+failed refresh. A 100% usage reading alone does not prove authentication has expired.
+
+MiniMax 验证信息失效时，可在账号卡片中点击 **更新验证头**，粘贴浏览器新复制的完整
+cURL，再保存并刷新。刷新失败时保留上次成功的数据，并显示错误提示。
 
 Codex official and NewAPI endpoints can coexist; the server merges them into one
 card. `curl -sS`, `--proxy` and `--insecure` flags are translated into Python HTTPS
@@ -198,11 +221,15 @@ and shows "接口未返回" instead of fabricating usage.
 - When a `codexNewApi` request is saved the refresh automatically skips the official
   `codexUsage` request, and likewise for `codexNewApiCredits` → `codexCredits`. This
   avoids repeated `401` noise when the official token is stale.
-- Raw curl (Token / Cookie / Digest) is stored in `requests.json` in plaintext, and
-  Volcengine AK/SK is stored in `credentials.json` in plaintext. Kimi RefreshToken
-  input is reduced to its token and required headers in `requests.json`; it is not
-  returned by the API. Never commit real credentials; the README and tests use
-  redacted samples only.
+- `requests.json` stores account curl text, Volcengine AK/SK, Google refresh tokens
+  and Kimi refresh configuration in plaintext. `credentials.json` may also contain
+  legacy provider credentials. Never commit real credentials or copied live requests.
+- `/api/requests` removes separate Kimi refresh fields and proxy settings and masks
+  the `sk` and Google `refreshToken` fields. It still returns saved curl text, which
+  can contain Authorization headers and cookies; this endpoint is sensitive.
+- The page lock prevents accidental edits in the UI; it is not authentication or
+  API access control. Protect the service with network restrictions or an
+  authenticated reverse proxy before granting access beyond a trusted environment.
 - Restrict `8080` to a trusted LAN and rotate credentials immediately on leak.
 
 ## Tests
@@ -213,8 +240,26 @@ PYTHONPATH=. python3 -m unittest discover -s tests -p 'test_*.py'
 python3 -m py_compile server.py
 ```
 
-CI runs the same commands on every push and pull request; see
+CI runs the same commands on pushes to `main` / `master` and pull requests targeting
+those branches; see
 [`.github/workflows/test.yml`](./.github/workflows/test.yml).
+
+## Repository Synchronization / 仓库同步
+
+The development repository on Gitea retains the complete commit history. GitHub
+publishes reviewed snapshots as a single commit per synchronization, based on the
+current GitHub `main`. Use a separate publication branch and leave the development
+branch and any unrelated working changes intact. After a squash publication, the
+two histories can differ even when their file contents match.
+
+Before publishing, inspect the outgoing tree and commit metadata for credentials,
+personal information and private infrastructure details. Use a GitHub noreply
+email, run the required checks, and satisfy GitHub branch protection through a pull
+request. Verify the resulting remote commit and remove temporary publication branches
+when they are no longer needed. See [AGENTS.md](./AGENTS.md) for contributor rules.
+
+Gitea 保留完整开发历史；GitHub 每次同步发布一个经过审查的压缩提交。不要为了对齐
+GitHub 而重写 Gitea 或本地开发分支，也不要将运行数据、备份或私人部署信息纳入提交。
 
 ## License
 
